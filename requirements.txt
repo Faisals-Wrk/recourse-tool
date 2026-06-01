@@ -1,0 +1,14 @@
+# =============================================================================
+# requirements.txt — Algorithmic Recourse Tool
+# =============================================================================
+# Install: pip install -r requirements.txt
+#
+# Core ML + data
+numpy>=1.24
+pandas>=1.5
+scikit-learn>=1.2
+scipy>=1.10          # proximity optimization (Algorithm C, L-BFGS-B)
+
+# App + visualization
+streamlit>=1.30
+plotly>=5.18
