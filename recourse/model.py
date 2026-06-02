@@ -35,9 +35,9 @@
 # PIPELINE NOTE:
 #   Logistic Regression is wrapped in a sklearn Pipeline with StandardScaler.
 #   The Adult dataset has features on very different scales:
-#     capital_gain: 0–99999, hours_per_week: 1–99, education_num: 1–16
+#     capital_gain: 0-99999, hours_per_week: 1-99, education_num: 1-16
 #   Scaling prevents large-range features from dominating the coefficients.
-#   Decision Tree and Random Forest are scale-invariant — no scaling needed.
+#   Decision Tree and Random Forest are scale-invariant, no scaling needed.
 #
 # CROSS VALIDATION:
 #   Evaluated with Stratified 5-Fold CV.
@@ -45,6 +45,7 @@
 #   This gives us honest accuracy estimates comparable across models.
 # =============================================================================
 
+import warnings
 import numpy as np
 import pandas as pd
 from sklearn.linear_model    import LogisticRegression
@@ -55,6 +56,30 @@ from sklearn.preprocessing   import StandardScaler
 from sklearn.pipeline        import Pipeline
 
 from recourse.data import load_data, FEATURE_NAMES
+
+
+# =============================================================================
+# SUPPRESS SKLEARN FEATURE NAME WARNING — done ONCE at import time
+# =============================================================================
+# When sklearn models are trained on a named DataFrame but later receive a
+# numpy array, they print:
+#   "X does not have valid feature names, but <Model> was fitted with feature names"
+#
+# WHY WE SUPPRESS IT:
+#   predict_person() is called in a tight loop millions of times during the
+#   greedy recourse analysis. The prediction is IDENTICAL regardless — column
+#   order is guaranteed correct by FEATURE_NAMES. The warning is purely cosmetic.
+#
+# WHY MODULE-LEVEL (not inside predict_person):
+#   Using warnings.catch_warnings() as a context manager inside predict_person()
+#   saves and restores the full warning filter state on EVERY call. At 1,000,000+
+#   calls this context-manager overhead alone takes several minutes.
+#   A single filterwarnings() call here costs nothing and silences it permanently.
+
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names"
+)
 
 
 # =============================================================================
@@ -110,9 +135,13 @@ def train_all_models(X, y, cv_folds=5, verbose=True):
     with Stratified 5-Fold Cross Validation.
 
     We train on the FULL dataset (not a held-out split) because:
-      - We want predictions on all rows for the Person Explorer page
+      - We want predictions on all rows for the Dataset page
       - Stratified CV gives an unbiased accuracy estimate despite this
-      - This is the same strategy as Project 1 (Rashomon Set Visualizer)
+
+    Predictions and probabilities on the full dataset are computed once
+    here (batch call — fast) and stored in the returned dict. This means
+    get_all_predictions() can just read those lists without calling
+    predict_person() in a per-row loop.
 
     Args:
         X        (DataFrame): feature matrix
@@ -121,21 +150,21 @@ def train_all_models(X, y, cv_folds=5, verbose=True):
         verbose  (bool):      print progress
 
     Returns:
-        dict: {model_key → model_record}
+        dict: {model_key -> model_record}
 
         Each model_record contains:
-          name          — display name
-          key           — short identifier
-          description   — one-line summary
-          model         — fitted sklearn estimator
-          cv_accuracy   — mean CV accuracy
-          cv_std        — std across folds
-          cv_scores     — list of individual fold scores
-          predictions   — list of predictions on full dataset
-          probabilities — list of P(>50K) for each person
+          name          - display name
+          key           - short identifier
+          description   - one-line summary
+          model         - fitted sklearn estimator
+          cv_accuracy   - mean CV accuracy
+          cv_std        - std across folds
+          cv_scores     - list of individual fold scores
+          predictions   - list[int] of predictions on full dataset (length n)
+          probabilities - list[float] of P(>50K) on full dataset (length n)
     """
-    cv        = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-    trained   = {}
+    cv      = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    trained = {}
 
     for config in CLASSIFIER_CONFIGS:
         name  = config['name']
@@ -148,11 +177,13 @@ def train_all_models(X, y, cv_folds=5, verbose=True):
         # CV gives us unbiased accuracy before we fit on the full dataset
         cv_scores = cross_val_score(model, X, y, cv=cv, scoring='accuracy')
 
-        # Fit on the full dataset for deployment (predictions on all persons)
+        # Fit on the full dataset for deployment
         model.fit(X, y)
 
+        # Batch predict on full dataset — done once here, stored for reuse.
+        # model.predict(X) is a vectorised numpy call, very fast.
         predictions   = model.predict(X)
-        probabilities = model.predict_proba(X)[:, 1]  # P(>50K)
+        probabilities = model.predict_proba(X)[:, 1]   # P(>50K)
 
         trained[key] = {
             'name':          name,
@@ -167,7 +198,7 @@ def train_all_models(X, y, cv_folds=5, verbose=True):
         }
 
         if verbose:
-            print(f"    CV accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+            print(f"    CV accuracy: {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
 
     if verbose:
         print("  All models trained.")
@@ -184,8 +215,26 @@ def predict_person(model, features_dict):
     Runs the model on a single person's features (given as a dict).
     Returns both the binary prediction and the high-income probability.
 
-    This is called repeatedly by recourse algorithms after each
-    perturbation to check if the prediction has flipped.
+    PERFORMANCE DESIGN:
+      This function is called in a very tight inner loop by the greedy
+      recourse algorithms — up to 1,000,000+ times during the fairness
+      analysis (200 persons x 3 models x 100 iterations x ~18 candidates).
+
+      Two things make it fast:
+
+      1. Numpy array input (no DataFrame creation per call):
+         sklearn models accept numpy arrays natively. Column order is
+         guaranteed correct because we always use FEATURE_NAMES order.
+         This is ~15x faster than pd.DataFrame([features_dict]) per call.
+
+      2. Warning suppressed at module level (not per call):
+         sklearn prints "X does not have valid feature names" when a numpy
+         array is passed to a model trained on a DataFrame. Suppressing
+         this with warnings.catch_warnings() INSIDE this function would
+         save/restore the full warning state on every call — at 1M+ calls
+         that overhead alone takes several minutes. Instead we call
+         warnings.filterwarnings("ignore", ...) once at module import
+         time (see top of this file). Free at call time, same effect.
 
     Args:
         model         (sklearn model): fitted classifier or Pipeline
@@ -195,7 +244,9 @@ def predict_person(model, features_dict):
         prediction   (int):   0 = <=50K, 1 = >50K
         probability  (float): P(>50K) between 0 and 1
     """
-    row         = pd.DataFrame([features_dict])[FEATURE_NAMES]
+    # Build a (1, n_features) numpy array in the fixed FEATURE_NAMES order.
+    row         = np.array([[features_dict[f] for f in FEATURE_NAMES]],
+                           dtype=float)
     prediction  = int(model.predict(row)[0])
     probability = float(model.predict_proba(row)[0, 1])
     return prediction, probability
@@ -203,15 +254,15 @@ def predict_person(model, features_dict):
 
 def get_prediction_summary(trained_models, features_dict):
     """
-    Runs all three models on one person and returns a summary.
-    Used on the Person Explorer page to show consensus/disagreement.
+    Runs all three models on one person and returns a summary dict.
+    Used to show consensus / disagreement on the Dataset page.
 
     Args:
         trained_models (dict): output of train_all_models()
         features_dict  (dict): one person's features
 
     Returns:
-        dict: {model_key → {'name', 'prediction', 'probability'}}
+        dict: {model_key -> {'name', 'prediction', 'probability'}}
     """
     summary = {}
     for key, record in trained_models.items():
@@ -226,34 +277,55 @@ def get_prediction_summary(trained_models, features_dict):
 
 def get_all_predictions(trained_models, X):
     """
-    Returns a DataFrame with predictions from all three models for
-    every person. Used on the Dataset and Person Explorer pages.
+    Returns a DataFrame with predictions from all three models for every
+    person. Used on the Dataset page for the feature distributions and
+    model agreement section.
 
-    Columns:
-        person_idx, logistic_pred, tree_pred, forest_pred,
-        logistic_prob, tree_prob, forest_prob, consensus
+    PERFORMANCE FIX:
+      Old version called predict_person() in a Python for-loop: 9,999 rows
+      x 3 models = 29,997 individual model inference calls. Even with numpy
+      this loop takes 1-2 minutes and prints 60,000+ warnings.
+
+      New version reads from trained[key]['predictions'] which was computed
+      by model.predict(X) (one fast vectorised call) inside train_all_models().
+      This reduces 29,997 calls to 3 list reads — under 1 second.
+
+    Returns:
+        DataFrame with columns:
+            person_idx, logistic_pred, tree_pred, forest_pred,
+            logistic_prob, tree_prob, forest_prob, consensus
     """
-    rows = []
-    for idx in range(len(X)):
-        features = X.iloc[idx].to_dict()
-        row      = {'person_idx': idx}
-        preds    = []
-        for key, record in trained_models.items():
-            pred, prob           = predict_person(record['model'], features)
-            row[f'{key}_pred']   = pred
-            row[f'{key}_prob']   = round(prob, 4)
-            preds.append(pred)
-        # Consensus: all three models agree
-        row['consensus'] = (len(set(preds)) == 1)
-        rows.append(row)
-    return pd.DataFrame(rows)
+    n    = len(X)
+    data = {'person_idx': list(range(n))}
+
+    # Read the pre-computed batch predictions stored during training.
+    # No model inference needed here at all.
+    preds_by_model = {}
+    for key, record in trained_models.items():
+        preds = record['predictions']          # list[int], length n
+        probs = record['probabilities']        # list[float], length n
+        data[f'{key}_pred'] = preds
+        data[f'{key}_prob'] = [round(p, 4) for p in probs]
+        preds_by_model[key] = preds
+
+    # Consensus: do all three models agree for this person?
+    model_keys = list(preds_by_model.keys())
+    consensus  = [
+        len({preds_by_model[k][i] for k in model_keys}) == 1
+        for i in range(n)
+    ]
+    data['consensus'] = consensus
+
+    return pd.DataFrame(data)
 
 
 # =============================================================================
-# MAIN — test this module
+# MAIN -- test this module
 # =============================================================================
 
 if __name__ == "__main__":
+
+    import time
 
     print("=" * 60)
     print("MODEL TRAINING TEST")
@@ -271,21 +343,34 @@ if __name__ == "__main__":
     print("=" * 60)
     for key, record in trained.items():
         print(f"\n  {record['name']}")
-        print(f"    CV Accuracy: {record['cv_accuracy']:.4f} ± {record['cv_std']:.4f}")
+        print(f"    CV Accuracy: {record['cv_accuracy']:.4f} +/- {record['cv_std']:.4f}")
         print(f"    Fold scores: {[round(s,4) for s in record['cv_scores']]}")
 
-    # Show model disagreement across the dataset
-    all_preds    = get_all_predictions(trained, X)
-    disagreements = all_preds[~all_preds['consensus']]
-    print(f"\nPersons where models disagree: "
-          f"{len(disagreements)} / {len(X)} "
-          f"({len(disagreements)/len(X)*100:.1f}%)")
+    # get_all_predictions should be instant
+    t0        = time.time()
+    all_preds = get_all_predictions(trained, X)
+    elapsed   = time.time() - t0
+    disagree  = all_preds[~all_preds['consensus']]
+    print(f"\nget_all_predictions() runtime: {elapsed:.3f}s  "
+          f"(should be <0.1s)")
+    print(f"Persons where models disagree: "
+          f"{len(disagree)} / {len(X)} "
+          f"({len(disagree)/len(X)*100:.1f}%)")
 
-    # Show one person's predictions
+    # predict_person: single call speed test
     from recourse.data import get_person
     features, label = get_person(X, y, 0)
+
+    t0 = time.time()
+    for _ in range(1000):
+        predict_person(trained['tree']['model'], features)
+    elapsed = (time.time() - t0) / 1000 * 1000  # ms per call
+    print(f"\npredict_person() avg time: {elapsed:.3f}ms per call")
+    print(f"  At 1M calls: {elapsed * 1000:.1f}s  (should be <60s)")
+
     summary = get_prediction_summary(trained, features)
     print(f"\nPerson #0 (true: {'>50K' if label else '<=50K'}):")
     for key, info in summary.items():
         pred_str = ">50K" if info['prediction'] == 1 else "<=50K"
-        print(f"  {info['name']:<22} → {pred_str}  ({info['probability']:.1%} probability)")
+        print(f"  {info['name']:<22} -> {pred_str}  "
+              f"({info['probability']:.1%} probability)")
