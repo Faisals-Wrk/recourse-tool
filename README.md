@@ -8,7 +8,7 @@ Built on the UCI Adult Income (1994 Census) dataset. Three classifiers, three se
 
 ## Live Demo
 
-Deploy to Streamlit Cloud (see [Deployment](#deployment) below).  
+Deployed to Streamlit Cloud (see [Deployment](#deployment) below).  
 First visitor triggers a 7–11 minute cache build. Every visitor after that is instant.
 
 ---
@@ -107,12 +107,9 @@ Revert to `sample_size=150, max_iterations=80` before deployment. At ~3ms per RF
 
 ## Deployment
 
-### Streamlit Cloud (recommended, free)
+### Streamlit Cloud
 
-1. Push this repository to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io)
-3. Click **New app** → select your repository → set main file to `app.py`
-4. Click **Deploy**
+Go to 🔗 **[recourse-tool.streamlit.app](https://recourse-tool-a28frqtenwfkpg2cdpquz2.streamlit.app/)**
 
 The first visitor triggers the 7–11 minute cache build for the fairness analysis. Every visitor after that loads instantly — Streamlit Cloud persists the `@st.cache_data` result across sessions.
 
